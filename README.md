@@ -49,7 +49,15 @@ uv run pytest -v
 
 ## Evals on pull requests
 
-`.github/workflows/evals.yml` runs on every PR to `main` that changes code:
+`.github/workflows/evals.yml` runs when you add the `run-evals` label to a PR to `main`.
+It doesn't run on other PRs or pushes. When it finishes, it removes the label, so to
+re-run on newer commits you add the label again:
+
+```bash
+gh pr edit <number> --add-label run-evals
+```
+
+What it does:
 
 1. It checks out the PR branch and the baseline, which is the `main` commit the
    branch started from (`git merge-base`).
@@ -65,7 +73,7 @@ uv run pytest -v
    the job summary. On a regression the job fails.
 4. The raw judged results are uploaded as the `eval-results` artifact.
 
-Cost per PR push: 2 × (20 agent runs + 60 judge calls).
+Cost per run: 2 × (20 agent runs + 60 judge calls).
 
 Try the comparison locally on two judged files:
 

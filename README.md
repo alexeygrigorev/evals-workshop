@@ -28,6 +28,20 @@ uv run python -m evals.synthetic.run --limit 5 --concurrency 3
 uv run python -m evals.synthetic.run_judge --data evals/synthetic/data/evals_run_sample.json
 ```
 
+## Tests and CI
+
+```bash
+uv run pytest -v
+```
+
+- `tests/test_search.py`: offline checks on the FAQ search. These don't need an API key.
+- `tests/test_agent.py`: one real agent run (one question). It checks that the agent
+  calls `search`, that the answer ends with a `Sources` section, and that the cited
+  ids come from the search results. Locally these tests skip without
+  `OPENAI_API_KEY`. In CI they fail without it.
+- `.github/workflows/tests.yml` runs the suite on every push to `main` and on
+  manual dispatch. It needs an `OPENAI_API_KEY` repository secret.
+
 ## Plan for the workshop (to build live)
 
 1. Deterministic tests (`tests/`, pytest). These are cheap and run on every push:

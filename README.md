@@ -47,6 +47,32 @@ uv run pytest -v
   global uv config that `uv.lock` was created with. Without it, `uv sync --locked`
   fails on the runner.
 
+## Evals on pull requests
+
+`.github/workflows/evals.yml` runs on every PR to `main` that changes code:
+
+1. It checks out the PR branch and the baseline, which is the `main` commit the
+   branch started from (`git merge-base`).
+2. Both versions run the same 20 questions (`EVAL_LIMIT`, seed 42). The eval harness,
+   judge and questions come from the PR for both runs, so only the agent code differs.
+3. `evals/ci/compare.py` builds a table with the pass rate per check (correctness,
+   instruction following, trajectory) for baseline vs feature. It ends with a verdict:
+   - ❌ don't merge: any check drops by more than 10 pp, or there are more agent errors
+   - ✅ merge: something improved by more than 10 pp and nothing regressed
+   - ✅ OK to merge: no significant change
+
+   The table is posted as a PR comment, which is updated on each push, and added to
+   the job summary. On a regression the job fails.
+4. The raw judged results are uploaded as the `eval-results` artifact.
+
+Cost per PR push: 2 × (20 agent runs + 60 judge calls).
+
+Try the comparison locally on two judged files:
+
+```bash
+uv run python -m evals.ci.compare --base base_judged.json --feature feature_judged.json
+```
+
 ## Plan for the workshop (to build live)
 
 1. Deterministic tests (`tests/`, pytest). These are cheap and run on every push:

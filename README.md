@@ -41,6 +41,10 @@ uv run pytest -v
   `OPENAI_API_KEY`. In CI they fail without it.
 - `.github/workflows/tests.yml` runs the suite on every push to `main` and on
   manual dispatch. It needs an `OPENAI_API_KEY` repository secret.
+- The job runs on a self-hosted runner (`runs-on: [self-hosted, hetzner]`), not on
+  GitHub-hosted machines. The workflow sets `UV_EXCLUDE_NEWER: "7 days"` to match the
+  global uv config that `uv.lock` was created with. Without it, `uv sync --locked`
+  fails on the runner.
 
 ## Plan for the workshop (to build live)
 

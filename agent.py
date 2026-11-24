@@ -5,7 +5,7 @@ from openai import AsyncOpenAI
 from renderer import BaseRenderer
 from search import search, search_tool
 
-MODEL_NAME = "gpt-5.4-mini"
+MODEL_NAME = "gpt-6-luna"
 MAX_ITERATIONS = 5
 
 INSTRUCTIONS = """

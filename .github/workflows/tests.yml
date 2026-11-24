@@ -3,6 +3,13 @@ name: Tests
 on:
   push:
     branches: [main]
+    # Only code changes trigger the (paid) test run; docs-only pushes skip it.
+    paths:
+      - "**.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".python-version"
+      - ".github/workflows/tests.yml"
   workflow_dispatch:
 
 env:

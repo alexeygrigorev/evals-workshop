@@ -5,6 +5,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  # Same as the global ~/.config/uv/uv.toml used when uv.lock was created;
+  # without it `uv sync --locked` sees a different resolution and fails.
+  UV_EXCLUDE_NEWER: "7 days"
+
 jobs:
   test:
     runs-on: [self-hosted, hetzner]

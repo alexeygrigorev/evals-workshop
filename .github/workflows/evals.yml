@@ -1,22 +1,18 @@
 name: Evals
 
-# On every PR that changes code: run the same eval on the baseline (the main
-# commit the branch started from) and on the PR branch, then post a comparison
-# table with a merge recommendation as a PR comment.
+# Runs only when the `run-evals` label is added to a PR (evals cost money, so
+# not every PR runs them). It runs the same eval on the baseline (the main
+# commit the branch started from) and on the PR branch, posts a comparison
+# table with a merge recommendation as a PR comment, then removes the label.
+# To re-run after new commits, add the label again.
 
 on:
   pull_request:
     branches: [main]
-    paths:
-      - "**.py"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".python-version"
-      - "evals/synthetic/data/questions_sample.csv"
-      - ".github/workflows/evals.yml"
+    types: [labeled]
   workflow_dispatch:
 
-# A new push to the same PR cancels the eval that's still running for it.
+# Re-adding the label while an eval is running cancels the old run.
 concurrency:
   group: evals-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -24,6 +20,7 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 
 env:
   # Same as the global ~/.config/uv/uv.toml used when uv.lock was created.
@@ -33,6 +30,7 @@ env:
 
 jobs:
   compare:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'run-evals'
     runs-on: [self-hosted, hetzner]
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -40,6 +38,9 @@ jobs:
       - name: Check out the PR branch
         uses: actions/checkout@v4
         with:
+          # The PR branch itself, not GitHub's temporary merge commit, so the
+          # baseline is the main commit the branch was created from.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Install uv
@@ -115,6 +116,12 @@ jobs:
         run: |
           echo "::error::Eval regression: see the comparison table."
           exit 1
+
+      - name: Remove the run-evals label
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X DELETE repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/run-evals || true
 
       - name: Remove the baseline worktree
         if: always()

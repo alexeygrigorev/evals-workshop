@@ -35,7 +35,9 @@ from openai import AsyncOpenAI
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import agent  # noqa: E402
 from agent import run_agent  # noqa: E402
+from pricing import request_cost, require_prices  # noqa: E402
 from renderer import BaseRenderer  # noqa: E402
 from search import init_index  # noqa: E402
 
@@ -74,16 +76,94 @@ class TrajectoryRenderer(BaseRenderer):
         return "".join(self.answer_parts)
 
 
+class UsageTracker:
+    """Wraps the OpenAI client and records the token usage and cost of every
+    Responses API call the agent makes.
+
+    It works without changes to agent.py (so it also measures the baseline
+    version in CI): the agent only sees an object with `.responses.stream`
+    and `.responses.create`, everything else passes through.
+    """
+
+    def __init__(self, client: AsyncOpenAI):
+        self._client = client
+        self.calls: list[dict] = []
+        self.responses = _TrackedResponses(client.responses, self)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    def record(self, model: str, response) -> None:
+        usage = getattr(response, "usage", None)
+        details = getattr(usage, "input_tokens_details", None)
+        u = {
+            "input": getattr(usage, "input_tokens", 0) or 0,
+            "cached": getattr(details, "cached_tokens", 0) or 0,
+            "output": getattr(usage, "output_tokens", 0) or 0,
+        }
+        # Price by the model name the agent requested (the response may
+        # report a dated snapshot name).
+        self.calls.append({"model": model, "usage": u, "cost_usd": request_cost(model, u)})
+
+    def summary(self) -> dict:
+        total = {"input": 0, "cached": 0, "output": 0}
+        for call in self.calls:
+            for key in total:
+                total[key] += call["usage"][key]
+        return {
+            "models": sorted({c["model"] for c in self.calls}),
+            "requests": len(self.calls),
+            "tokens": total,
+            "cost_usd": sum(c["cost_usd"] for c in self.calls),
+        }
+
+
+class _TrackedResponses:
+    def __init__(self, responses, tracker: UsageTracker):
+        self._responses = responses
+        self._tracker = tracker
+
+    def __getattr__(self, name):
+        return getattr(self._responses, name)
+
+    async def create(self, **kwargs):
+        response = await self._responses.create(**kwargs)
+        self._tracker.record(kwargs.get("model"), response)
+        return response
+
+    def stream(self, **kwargs):
+        return _TrackedStream(self._responses.stream(**kwargs), kwargs.get("model"), self._tracker)
+
+
+class _TrackedStream:
+    def __init__(self, manager, model: str, tracker: UsageTracker):
+        self._manager = manager
+        self._model = model
+        self._tracker = tracker
+        self._stream = None
+
+    async def __aenter__(self):
+        self._stream = await self._manager.__aenter__()
+        return self._stream
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self._tracker.record(self._model, await self._stream.get_final_response())
+        return await self._manager.__aexit__(exc_type, exc, tb)
+
+
 async def run_agent_on_row(client: AsyncOpenAI, row: dict) -> dict:
-    """Run the agent on a single question row and capture answer + trajectory."""
+    """Run the agent on a single question row and capture answer, trajectory and cost."""
     renderer = TrajectoryRenderer()
+    tracker = UsageTracker(client)
     try:
-        answer = await run_agent(client, row["question"], renderer)
+        answer = await run_agent(tracker, row["question"], renderer)
         return {
             "input": row,
             "rag_response": {"answer": answer},
             "tools": renderer.tools,
             "iterations": renderer.iterations,
+            "agent_usage": tracker.summary(),
         }
     except Exception as exc:
         return {
@@ -91,6 +171,7 @@ async def run_agent_on_row(client: AsyncOpenAI, row: dict) -> dict:
             "rag_response": {"answer": f"Agent error: {exc}"},
             "tools": renderer.tools,
             "iterations": renderer.iterations,
+            "agent_usage": tracker.summary(),
             "error": str(exc),
         }
 
@@ -109,6 +190,8 @@ def report(results: list[dict], elapsed: float) -> None:
     print(f"  Questions w/o tools : {no_tools}")
     print(f"  Total tool calls    : {total_tools}")
     print(f"  Avg tool calls/q    : {total_tools / total:.2f}" if total else "")
+    print(f"  Agent model         : {agent.MODEL_NAME}")
+    print(f"  Agent cost          : ${sum(r['agent_usage']['cost_usd'] for r in results):.5f}")
     print(f"  Total time          : {fmt_time(elapsed)}")
     print("=" * 55)
 
@@ -130,6 +213,7 @@ async def main() -> None:
     load_dotenv()
     if not os.getenv("OPENAI_API_KEY"):
         raise SystemExit("OPENAI_API_KEY is not set (put it in .env).")
+    require_prices(agent.MODEL_NAME)
 
     print(f"Loading questions from {args.questions}...")
     df = pd.read_csv(args.questions)

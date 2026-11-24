@@ -73,6 +73,25 @@ What it does:
    the job summary. On a regression the job fails.
 4. The raw judged results are uploaded as the `eval-results` artifact.
 
+### Cost
+
+- `pricing.py` holds the standard-tier price of every OpenAI text model, taken from
+  https://developers.openai.com/api/docs/pricing (checked 2026-11-24).
+  Cost is computed per request, because requests over 272K input tokens use the
+  long-context rates.
+- The eval runner wraps the OpenAI client and records the tokens and cost of every
+  agent call (`agent_usage` in the run JSON). This doesn't need changes to `agent.py`,
+  so it also works for the baseline. The judge stores `cost_usd` for each check.
+- If the agent's or the judge's model isn't in `PRICES`, the eval scripts stop before
+  making any API calls, and `tests/test_pricing.py` fails. To switch to a new model,
+  add its price first.
+- The PR comment has a cost table: the agent model, the agent cost per question and in
+  total, and the judge cost. The verdict takes cost into account. A change counts when
+  it's larger than ±10%:
+  - ⚠️ your call: quality improves, but the agent costs more
+  - ❌ don't merge: same quality, but more expensive
+  - ✅ merge: same quality, cheaper
+
 Cost per run: 2 × (20 agent runs + 60 judge calls).
 
 Try the comparison locally on two judged files:

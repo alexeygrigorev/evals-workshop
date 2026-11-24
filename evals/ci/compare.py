@@ -48,6 +48,24 @@ def agent_errors(entries: list[dict]) -> int:
     return sum(1 for e in entries if "error" in e)
 
 
+def costs(entries: list[dict]) -> dict:
+    """Agent and judge cost of a run. Agent cost is None for runs without usage data."""
+    has_usage = bool(entries) and all("agent_usage" in e for e in entries)
+    agent = sum(e["agent_usage"]["cost_usd"] for e in entries) if has_usage else None
+    judge = sum(
+        e.get(key, {}).get("cost_usd", 0.0) for e in entries for key in CHECKS
+    )
+    models = sorted({m for e in entries for m in e.get("agent_usage", {}).get("models", [])})
+    return {"agent": agent, "judge": judge, "models": models, "n": len(entries)}
+
+
+def cost_change(base: float | None, feature: float | None) -> float | None:
+    """Relative change of the agent cost in percent, None if unknown."""
+    if base is None or feature is None or base == 0:
+        return None
+    return 100.0 * (feature - base) / base
+
+
 def flipped(base: list[dict], feature: list[dict], key: str) -> tuple[list[str], list[str]]:
     """Questions whose score changed between runs: (good->bad, bad->good)."""
     base_by_q = {e["input"]["question"]: e.get(key, {}).get("score") for e in base}
@@ -62,7 +80,8 @@ def flipped(base: list[dict], feature: list[dict], key: str) -> tuple[list[str],
     return worse, better
 
 
-def compare(base: list[dict], feature: list[dict], tolerance: float) -> dict:
+def compare(base: list[dict], feature: list[dict], tolerance: float,
+            cost_tolerance: float = 10.0) -> dict:
     base_rates, feature_rates = pass_rates(base), pass_rates(feature)
     rows = []
     for key, label in CHECKS.items():
@@ -86,15 +105,28 @@ def compare(base: list[dict], feature: list[dict], tolerance: float) -> dict:
     regressions = [r for r in rows if r["status"] == "regression"]
     improvements = [r for r in rows if r["status"] == "improvement"]
 
+    base_cost, feature_cost = costs(base), costs(feature)
+    delta_cost = cost_change(base_cost["agent"], feature_cost["agent"])
+    more_expensive = delta_cost is not None and delta_cost > cost_tolerance
+    cheaper = delta_cost is not None and delta_cost < -cost_tolerance
+
     if regressions or feature_err > base_err:
         verdict = "dont_merge"
+    elif improvements and more_expensive:
+        verdict = "tradeoff"
     elif improvements:
         verdict = "merge_improvement"
+    elif more_expensive:
+        verdict = "dont_merge_cost"
+    elif cheaper:
+        verdict = "merge_cheaper"
     else:
         verdict = "merge_neutral"
 
     return {
         "rows": rows, "verdict": verdict, "tolerance": tolerance,
+        "cost_tolerance": cost_tolerance,
+        "base_cost": base_cost, "feature_cost": feature_cost, "cost_delta": delta_cost,
         "base_errors": base_err, "feature_errors": feature_err,
         "regressions": regressions, "improvements": improvements,
     }
@@ -104,9 +136,23 @@ STATUS_ICON = {"regression": "🔴", "improvement": "🟢", "no significant chan
 
 VERDICT_TEXT = {
     "dont_merge": "❌ **Don't merge.** The PR makes the agent worse on at least one check.",
-    "merge_improvement": "✅ **Merge.** The PR improves the agent and nothing regressed.",
-    "merge_neutral": "✅ **OK to merge.** No significant change in eval quality.",
+    "dont_merge_cost": "❌ **Don't merge.** Same quality, but the agent costs more.",
+    "tradeoff": "⚠️ **Your call.** Quality improves, but the agent costs more. "
+                "Decide whether the improvement is worth the extra cost.",
+    "merge_improvement": "✅ **Merge.** The PR improves the agent, nothing regressed "
+                         "and it doesn't cost more.",
+    "merge_cheaper": "✅ **Merge.** Same quality, and the agent is cheaper.",
+    "merge_neutral": "✅ **OK to merge.** No significant change in quality or cost.",
 }
+FAILING_VERDICTS = {"dont_merge", "dont_merge_cost"}
+
+
+def _usd(value: float | None) -> str:
+    return "n/a" if value is None else f"${value:.4f}"
+
+
+def _per_q(cost: dict) -> float | None:
+    return None if cost["agent"] is None or not cost["n"] else cost["agent"] / cost["n"]
 
 
 def render(result: dict, base_label: str, feature_label: str, n: int) -> str:
@@ -133,6 +179,31 @@ def render(result: dict, base_label: str, feature_label: str, n: int) -> str:
         f"| {result['feature_errors'] - result['base_errors']:+d} | |"
     )
 
+    bc, fc, dc = result["base_cost"], result["feature_cost"], result["cost_delta"]
+    if dc is None:
+        cost_change_cell, cost_status = "n/a", ""
+    else:
+        cost_change_cell = f"{dc:+.0f}%"
+        if dc > result["cost_tolerance"]:
+            cost_status = "🔴 more expensive"
+        elif dc < -result["cost_tolerance"]:
+            cost_status = "🟢 cheaper"
+        else:
+            cost_status = "⚪ no significant change"
+    lines += [
+        "",
+        "### Cost",
+        "",
+        f"| | Baseline ({base_label}) | Feature ({feature_label}) | Change | |",
+        "|---|---|---|---|---|",
+        f"| Agent model | {', '.join(bc['models']) or 'n/a'} | {', '.join(fc['models']) or 'n/a'} | | |",
+        f"| Agent cost per question | {_usd(_per_q(bc))} | {_usd(_per_q(fc))} | {cost_change_cell} | {cost_status} |",
+        f"| Agent cost ({n} questions) | {_usd(bc['agent'])} | {_usd(fc['agent'])} | {cost_change_cell} | |",
+        f"| Judge cost (eval only) | {_usd(bc['judge'])} | {_usd(fc['judge'])} | | |",
+    ]
+    total = sum(c for c in (bc["agent"], fc["agent"]) if c is not None) + bc["judge"] + fc["judge"]
+    lines += ["", f"This eval run cost {_usd(total)} in total (agent + judge, both versions)."]
+
     lines += ["", "### Verdict", "", VERDICT_TEXT[result["verdict"]], ""]
     reasons = []
     for r in result["regressions"]:
@@ -141,12 +212,17 @@ def render(result: dict, base_label: str, feature_label: str, n: int) -> str:
         reasons.append("- The feature branch has more agent errors than the baseline.")
     for r in result["improvements"]:
         reasons.append(f"- {r['label']} improved by {r['delta']:.0f} pp.")
+    if dc is not None and abs(dc) > result["cost_tolerance"]:
+        word = "more" if dc > 0 else "less"
+        reasons.append(f"- The agent costs {abs(dc):.0f}% {word} per question "
+                       f"({_usd(_per_q(bc))} → {_usd(_per_q(fc))}).")
     lines += reasons
     lines += [
         "",
         f"A change counts as significant when it's larger than ±{tol:.0f} percentage "
         f"points (about {max(1, round(tol * n / 100))} of {n} questions). Smaller changes "
-        "are within the noise of a non-deterministic agent and judge.",
+        "are within the noise of a non-deterministic agent and judge. "
+        f"A cost change counts when it's larger than ±{result['cost_tolerance']:.0f}%.",
     ]
 
     details = []
@@ -170,19 +246,21 @@ def main() -> None:
     parser.add_argument("--feature-label", default="PR")
     parser.add_argument("--tolerance", type=float, default=10.0,
                         help="Change in percentage points that counts as significant (default: 10).")
+    parser.add_argument("--cost-tolerance", type=float, default=10.0,
+                        help="Agent cost change in percent that counts as significant (default: 10).")
     parser.add_argument("--output", default="comparison.md")
     parser.add_argument("--fail-on-regression", action="store_true",
-                        help="Exit with code 1 when the verdict is 'don't merge'.")
+                        help="Exit with code 1 when the verdict is 'don't merge' (quality or cost).")
     args = parser.parse_args()
 
     base, feature = load(args.base), load(args.feature)
-    result = compare(base, feature, args.tolerance)
+    result = compare(base, feature, args.tolerance, args.cost_tolerance)
     md = render(result, args.base_label, args.feature_label, len(feature))
 
     Path(args.output).write_text(md)
     print(md)
 
-    if args.fail_on_regression and result["verdict"] == "dont_merge":
+    if args.fail_on_regression and result["verdict"] in FAILING_VERDICTS:
         sys.exit(1)
 
 

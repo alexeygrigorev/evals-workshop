@@ -25,10 +25,8 @@ from openai import AsyncOpenAI
 
 from evals.synthetic.judge import CHECKS, JUDGE_MODEL
 from evals.utils import DEFAULT_DATA, fmt_time, load_entries, map_progress
+from pricing import get_price, request_cost, require_prices
 
-# gpt-5.4-mini, USD per 1M tokens.
-# https://developers.openai.com/api/docs/models/gpt-5.4-mini
-PRICES = {"standard": {"input": 0.75, "cached": 0.075, "output": 4.50}}
 
 
 def empty_usage() -> dict:
@@ -56,21 +54,6 @@ def add_usage(total: dict, usage: dict) -> None:
         total[key] += usage.get(key, 0)
 
 
-def cost_usd(usage: dict, tier: str) -> float:
-    prices = PRICES[tier]
-    cached = min(usage["cached"], usage["input"])
-    uncached = usage["input"] - cached
-    return (
-        uncached * prices["input"]
-        + cached * prices["cached"]
-        + usage["output"] * prices["output"]
-    ) / 1_000_000
-
-
-def costs_usd(usage: dict) -> dict:
-    return {tier: cost_usd(usage, tier) for tier in PRICES}
-
-
 async def judge_indexed(client: AsyncOpenAI, item: tuple[int, dict]) -> tuple[int, dict]:
     index, entry = item
     return index, await judge_entry(client, entry)
@@ -95,6 +78,7 @@ async def judge_entry(client: AsyncOpenAI, entry: dict) -> dict:
             else:
                 result = parsed.model_dump()
             result["usage"] = usage_of(response)
+            result["cost_usd"] = request_cost(JUDGE_MODEL, result["usage"])
             tier = getattr(response, "service_tier", None)
             if tier:
                 result["service_tier"] = tier
@@ -125,10 +109,12 @@ def build_report(entries: list[dict], elapsed: float, data_path: Path, output_pa
         if entry.get(check["result_key"], {}).get("service_tier")
     })
     checks = []
+    overall_cost = 0.0
     for check in CHECKS:
         usage = empty_usage()
         good = 0
         requests = 0
+        cost = 0.0
         for entry in entries:
             result = entry.get(check["result_key"], {})
             if "usage" in result or "score" in result:
@@ -136,14 +122,17 @@ def build_report(entries: list[dict], elapsed: float, data_path: Path, output_pa
             if result.get("score") == "good":
                 good += 1
             add_usage(usage, _check_usage(entry, check))
+            # Cost is computed per request (long-context pricing is per request).
+            cost += result.get("cost_usd", 0.0)
         add_usage(overall, usage)
+        overall_cost += cost
         checks.append({
             "name": check["name"],
             "good": good,
             "bad": total - good,
             "requests": requests,
             "tokens": usage,
-            "cost_usd": costs_usd(usage),
+            "cost_usd": {"standard": cost},
         })
 
     return {
@@ -151,14 +140,14 @@ def build_report(entries: list[dict], elapsed: float, data_path: Path, output_pa
         "model": JUDGE_MODEL,
         "service_tier": "standard",
         "observed_service_tiers": tiers,
-        "prices_per_1m_usd": PRICES,
+        "prices_per_1m_usd": get_price(JUDGE_MODEL),
         "source": str(data_path),
         "judged_results": str(output_path),
         "entries": total,
         "requests": sum(item["requests"] for item in checks),
         "elapsed_seconds": round(elapsed, 3),
         "tokens": overall,
-        "cost_usd": costs_usd(overall),
+        "cost_usd": {"standard": overall_cost},
         "checks": checks,
     }
 
@@ -174,7 +163,7 @@ def render_report(report: dict) -> str:
         "# Judge report",
         "",
         f"Standard Responses API run of `{report['model']}` on {report['created_at']}.",
-        "Cost is what this run spends at the gpt-5.4-mini standard list rates.",
+        f"Cost is what this run spends at the {report['model']} standard list rates.",
         "",
         "## Run",
         "",
@@ -209,7 +198,7 @@ def render_report(report: dict) -> str:
         "",
         "## Cost",
         "",
-        "USD, using the gpt-5.4-mini list prices stored in this report.",
+        f"USD, using the {report['model']} list prices stored in this report.",
         "",
         "| Tier | This run |",
         "| --- | ---: |",
@@ -312,6 +301,7 @@ def main() -> None:
     load_dotenv()
     if not os.getenv("OPENAI_API_KEY"):
         raise SystemExit("OPENAI_API_KEY is not set (put it in .env).")
+    require_prices(JUDGE_MODEL)
 
     asyncio.run(run(args))
 
